@@ -10,7 +10,7 @@ This filter includes the following:
 A file detected as malware will be flagged and blocked.
 
 
-A file detected as likely NSFW will be flagged. The "likely" NSFW threshold is currently at 80%.
+A file detected as likely NSFW will be flagged. The "likely" NSFW threshold is currently at 75%.
 If the post the file is in gets reported by another user or the text of the post contains inappropriate content, the file will be blocked.
 
 
@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-import asyncio, os, redis.asyncio as redis, pymongo, minio, msgpack, json, clamd, mimetypes, time
+import asyncio, os, redis.asyncio as redis, pymongo, minio, msgpack, json, clamd, time
 from typing import TypedDict, Literal, Optional
 from enum import Enum
 from PIL import Image
@@ -38,6 +38,7 @@ class Event(TypedDict):
     username: str
     file_bucket: Literal["icons", "emojis", "stickers", "attachments"]
     file_hashes: list[str]
+    post_id: Optional[str]
     post_content: Optional[str]
 
 class FileClassification(TypedDict):
@@ -78,21 +79,20 @@ async def main():
         # Create file path
         fp = os.environ["TEMP_DIR"] + "/" + hash
 
+        # Get file mime
+        mime: str = db.files.find_one({"hash": hash})["mime"]
+
         # Download file to RAM dir
-        s3.fget_object(bucket, hash, fp)
+        if mime.startswith("video/"):  # download thumbnail for videos
+            s3.fget_object(bucket, hash+"_thumbnail", fp)
+        else:
+            s3.fget_object(bucket, hash, fp)
 
         # Scan with ClamAV
         clam_result, _ = list(cd.scan(fp).values())[0]
 
-        # Replace with thumbnail if file is a video
-        mime, _ = mimetypes.guess_type(f"file://{fp}")
-        if mime.startswith("video/"):
-            os.remove(fp)
-            s3.fget_object(bucket, hash+"_thumbnail", fp)
-
         # Scan for NSFW if file is an image
         nsfw_score = 0
-        mime, _ = mimetypes.guess_type(f"file://{fp}")
         if mime.startswith("image/"):
             for item in nsfw_image_detection(Image.open(fp)):
                 if item["label"] == "nsfw":
@@ -139,12 +139,12 @@ async def main():
             "note": f"File classifications that lead to ban:\n{json.dumps([{item["_id"]["hash"]: item["classification"]} for item in db.file_classifications.find({"_id.username": username})])}"
         }))
 
-    async def block_files(hashes: list[str], reason: str, send_alerts: bool = True):
+    async def block_files(hashes: list[str], reason: str, send_alerts: bool = True, post_id: str = None):
         for file_hash in hashes:
             try:
                 # Block file from being uploaded again
                 db.blocked_files.insert_one({
-                    "_id": {"$in": file_hash},
+                    "_id": file_hash,
                     "reason": reason,
                     "blocked_at": int(time.time())
                 })
@@ -162,6 +162,13 @@ async def main():
                             "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
                         }))
 
+                # Delete post
+                if post_id:
+                    await r.publish("admin", msgpack.packb({
+                        "op": "delete_post",
+                        "id": post_id
+                    }))
+
                 # Delete file from S3
                 for bucket in {file["bucket"] for file in files}:
                     s3.remove_object(bucket, file_hash)
@@ -169,6 +176,8 @@ async def main():
                         try:
                             s3.remove_object(bucket, file_hash+"_thumbnail")
                         except: pass
+                
+
             except Exception as e:
                 print(e)
 
@@ -197,7 +206,7 @@ async def main():
             likely_nsfw = [
                 hash
                 for hash, classification in file_classifications.items()
-                if classification["nsfw_score"] >= 0.8
+                if classification["nsfw_score"] >= 0.75
             ]
 
             # Escape if no malware or likely NSFW is detected
@@ -205,17 +214,21 @@ async def main():
                 continue
 
             # Block malware
-            await block_files(malware, "malware")
+            await block_files(malware, "malware", post_id=event.get("post_id"))
 
             # Block likely NSFW if the post likely contains inappropriate text or the post is reported
             if event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
-                await block_files(likely_nsfw, "likely_nsfw_and_inappropriate_post_content")
+                await block_files(likely_nsfw, "likely_nsfw_and_inappropriate_post_content", post_id=event.get("post_id"))
             elif event["type"] == EventType.POST_REPORTED.value:
-                await block_files(likely_nsfw, "likely_nsfw_and_post_reported")
+                await block_files(likely_nsfw, "likely_nsfw_and_post_reported", post_id=event.get("post_id"))
 
-            # Flag user
-            await flag_user(event["username"], file_classifications, auto_ban=True)
-        except ValueError as e:
+            # Flag user for malware and likely NSFW files
+            await flag_user(event["username"], {
+                hash: classification
+                for hash, classification in file_classifications.items()
+                if classification["malware"] or classification["nsfw_score"] >= 0.75
+            }, auto_ban=True)
+        except Exception as e:
             print(f"{message}: {e}")
 
 if __name__ == "__main__":
