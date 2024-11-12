@@ -118,27 +118,6 @@ async def main():
         top_classification = text_classifier(text)[0]["label"]
         return top_classification == "S" or top_classification == "S3"
 
-    async def flag_user(username: str, classifications: dict[str, FileClassification], auto_ban: bool = True):
-        # Log classifications
-        for file_hash, classification in classifications.items():
-            db.file_classifications.update_one({"_id": {"username": username, "hash": file_hash}}, {"$set": {
-                "classification": classification,
-                "time": int(time.time())
-            }}, upsert=True)
-
-        # Ban user if they have 3 or more classifications in the last 24 hours
-        if auto_ban and db.file_classifications.count_documents({"_id.username": username, "time": {"$gt": int(time.time())-86400}}) >= 3:
-            await ban_user(username)
-
-    async def ban_user(username: str):
-        await r.publish("admin", msgpack.packb({
-            "op": "ban_user",
-            "user": username,
-            "state": "perm_ban",
-            "reason": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material.",
-            "note": f"File classifications that lead to ban:\n{json.dumps([{item["_id"]["hash"]: item["classification"]} for item in db.file_classifications.find({"_id.username": username})])}"
-        }))
-
     async def block_files(hashes: list[str], reason: str, send_alerts: bool = True, post_id: str = None):
         for file_hash in hashes:
             try:
@@ -180,6 +159,38 @@ async def main():
 
             except Exception as e:
                 print(e)
+
+    async def flag_user(username: str, classifications: dict[str, FileClassification], auto_ban: bool = True):
+        # Log classifications
+        for file_hash, classification in classifications.items():
+            db.file_classifications.update_one({"_id": {"username": username, "hash": file_hash}}, {"$set": {
+                "classification": classification,
+                "time": int(time.time())
+            }}, upsert=True)
+
+        # Ban user if they have 3 or more classifications in the last 24 hours
+        if auto_ban and db.file_classifications.count_documents({"_id.username": username, "time": {"$gt": int(time.time())-86400}}) >= 3:
+            await ban_user(username)
+
+    async def ban_user(username: str):
+        # Ban user
+        await r.publish("admin", msgpack.packb({
+            "op": "ban_user",
+            "user": username,
+            "state": "perm_ban",
+            "reason": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material.",
+            "note": f"File classifications that lead to ban:\n{json.dumps([{item["_id"]["hash"]: item["classification"]} for item in db.file_classifications.find({"_id.username": username})])}"
+        }))
+
+        # Block previously classified likely NSFW files
+        file_hashes = [
+            classification["_id"]["hash"]
+            for classification in db.file_classifications.find({
+                "_id.username": username,
+                "classification.nsfw_score": {"$gte": 0.75}
+            })
+        ]
+        await block_files(file_hashes, "likely_nsfw_and_user_banned")
 
     # Start handling events
     async for message in pubsub.listen():
