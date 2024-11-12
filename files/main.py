@@ -140,29 +140,37 @@ async def main():
         }))
 
     async def block_files(hashes: list[str], reason: str, send_alerts: bool = True):
-        if not len(hashes):
-            return
-        
-        db.blocked_files.update_many(
-            {"_id": {"$in": hashes}},
-            {"$set": {
-                "reason": reason,
-                "blocked_at": int(time.time())
-            }},
-            upsert=True
-        )
+        for file_hash in hashes:
+            try:
+                # Block file from being uploaded again
+                db.blocked_files.insert_one({
+                    "_id": {"$in": file_hash},
+                    "reason": reason,
+                    "blocked_at": int(time.time())
+                })
 
-        if send_alerts:
-            uploaders = {
-                file["uploaded_by"]
-                for file in db.files.find({"hash": {"$in": hashes}})
-            }
-            for username in uploaders:
-                await r.publish("admin", msgpack.packb({
-                    "op": "alert_user",
-                    "user": username,
-                    "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
-                }))
+                # Get all uploads of this file
+                files = list(db.files.find({"hash": file_hash}, projection={"bucket": 1, "uploaded_by": 1}))
+
+                # Send alert to uploaders
+                if send_alerts:
+                    uploaders = {file["uploaded_by"] for file in files}
+                    for username in uploaders:
+                        await r.publish("admin", msgpack.packb({
+                            "op": "alert_user",
+                            "user": username,
+                            "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
+                        }))
+
+                # Delete file from S3
+                for bucket in {file["bucket"] for file in files}:
+                    s3.remove_object(bucket, file_hash)
+                    if bucket == "attachments":
+                        try:
+                            s3.remove_object(bucket, file_hash+"_thumbnail")
+                        except: pass
+            except Exception as e:
+                print(e)
 
     # Start handling events
     async for message in pubsub.listen():
@@ -209,7 +217,6 @@ async def main():
             await flag_user(event["username"], file_classifications, auto_ban=True)
         except ValueError as e:
             print(f"{message}: {e}")
-            continue
 
 if __name__ == "__main__":
     asyncio.run(main())
