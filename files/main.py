@@ -1,0 +1,215 @@
+"""
+Copyright Meower Media 2024.
+
+
+This filter includes the following:
+- Malware detection using ClamAV
+- NSFW detection using Falconsai/nsfw_image_detection and KoalaAI/Text-Moderation from Hugging Face
+
+
+A file detected as malware will be flagged and blocked.
+
+
+A file detected as likely NSFW will be flagged. The "likely" NSFW threshold is currently at 80%.
+If the post the file is in gets reported by another user or the text of the post contains inappropriate content, the file will be blocked.
+
+
+If a user accumulates 3 or more unique flags within 24 hours, they will be automatically banned.
+"""
+
+
+from dotenv import load_dotenv
+load_dotenv()
+
+
+import asyncio, os, redis.asyncio as redis, pymongo, minio, msgpack, json, clamd, mimetypes, time
+from typing import TypedDict, Literal, Optional
+from enum import Enum
+from PIL import Image
+from transformers import pipeline
+
+class EventType(Enum):
+    NEW_UPLOAD = 0
+    NEW_POST = 1
+    POST_REPORTED = 2
+
+class Event(TypedDict):
+    type: EventType
+    username: str
+    file_bucket: Literal["icons", "emojis", "stickers", "attachments"]
+    file_hashes: list[str]
+    post_content: Optional[str]
+
+class FileClassification(TypedDict):
+    malware: bool
+    nsfw_score: float
+
+async def main():
+    # Connect to Redis and initialise pub/sub
+    r = redis.from_url(os.environ["REDIS_URI"])
+    pubsub = r.pubsub(ignore_subscribe_messages=True)
+    await pubsub.subscribe("automod:files")
+
+    # Connect to MongoDB
+    db = pymongo.MongoClient(os.environ["MONGO_URI"])[os.environ["MONGO_DB"]]
+
+    # Connect to MinIO
+    s3 = minio.Minio(
+        os.environ["S3_ENDPOINT"],
+        access_key=os.environ["S3_ACCESS"],
+        secret_key=os.environ["S3_SECRET"],
+        secure=os.environ["S3_SECURE"] == "1"
+    )
+
+    # Connect to ClamAV daemon
+    cd = clamd.ClamdUnixSocket(path=os.environ["CLAMD_SOCK"])
+
+    # Initialise Hugging Face classifiers
+    nsfw_image_detection = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
+    text_classifier = pipeline("text-classification", model="KoalaAI/Text-Moderation")
+
+    async def get_file_classification(bucket: str, hash: str) -> FileClassification:
+        # Cached classification
+        classification = await r.get(f"automod:files:classification:{hash}")
+        if classification:
+            classification: FileClassification = msgpack.unpackb(classification)
+            return classification
+        
+        # Create file path
+        fp = os.environ["TEMP_DIR"] + "/" + hash
+
+        # Download file to RAM dir
+        s3.fget_object(bucket, hash, fp)
+
+        # Scan with ClamAV
+        clam_result, _ = list(cd.scan(fp).values())[0]
+
+        # Replace with thumbnail if file is a video
+        mime, _ = mimetypes.guess_type(f"file://{fp}")
+        if mime.startswith("video/"):
+            os.remove(fp)
+            s3.fget_object(bucket, hash+"_thumbnail", fp)
+
+        # Scan for NSFW if file is an image
+        nsfw_score = 0
+        mime, _ = mimetypes.guess_type(f"file://{fp}")
+        if mime.startswith("image/"):
+            for item in nsfw_image_detection(Image.open(fp)):
+                if item["label"] == "nsfw":
+                    nsfw_score = item["score"]
+
+        # Remove file
+        os.remove(fp)
+
+        # Create and cache classification for 24 hours
+        classification: FileClassification = {
+            "malware": clam_result == "FOUND",
+            "nsfw_score": nsfw_score
+        }
+        await r.set(f"automod:files:classification:{hash}", msgpack.packb(classification), ex=86400) 
+
+        return classification
+
+    def is_text_sexual(text: str) -> bool:
+        """
+        Returns whether the top classification of some text is sexual (S) or sexual/minors (S3).
+        """
+        
+        top_classification = text_classifier(text)[0]["label"]
+        return top_classification == "S" or top_classification == "S3"
+
+    async def flag_user(username: str, classifications: dict[str, FileClassification], auto_ban: bool = True):
+        # Log classifications
+        for file_hash, classification in classifications.items():
+            db.file_classifications.update_one({"_id": {"username": username, "hash": file_hash}}, {"$set": {
+                "classification": classification,
+                "time": int(time.time())
+            }}, upsert=True)
+
+        # Ban user if they have 3 or more classifications in the last 24 hours
+        if auto_ban and db.file_classifications.count_documents({"_id.username": username, "time": {"$gt": int(time.time())-86400}}) >= 3:
+            await ban_user(username)
+
+    async def ban_user(username: str):
+        await r.publish("admin", msgpack.packb({
+            "op": "ban_user",
+            "user": username,
+            "state": "perm_ban",
+            "reason": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material.",
+            "note": f"File classifications that lead to ban:\n{json.dumps([{item["_id"]["hash"]: item["classification"]} for item in db.file_classifications.find({"_id.username": username})])}"
+        }))
+
+    async def block_files(hashes: list[str], reason: str, send_alerts: bool = True):
+        if not len(hashes):
+            return
+        
+        db.blocked_files.update_many(
+            {"_id": {"$in": hashes}},
+            {"$set": {
+                "reason": reason,
+                "blocked_at": int(time.time())
+            }},
+            upsert=True
+        )
+
+        if send_alerts:
+            uploaders = {
+                file["uploaded_by"]
+                for file in db.files.find({"hash": {"$in": hashes}})
+            }
+            for username in uploaders:
+                await r.publish("admin", msgpack.packb({
+                    "op": "alert_user",
+                    "user": username,
+                    "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
+                }))
+
+    # Start handling events
+    async for message in pubsub.listen():
+        try:
+            # Parse event
+            if message["type"] != "message":
+                continue
+            event: Event = msgpack.unpackb(message["data"])
+
+            # Get file classifications
+            file_classifications: dict[str, FileClassification] = {
+                hash: await get_file_classification(event["file_bucket"], hash)
+                for hash in event["file_hashes"]
+            }
+
+            # Get file hashes of malware
+            malware = [
+                hash
+                for hash, classification in file_classifications.items()
+                if classification["malware"]
+            ]
+
+            # Get file hashes of likely NSFW
+            likely_nsfw = [
+                hash
+                for hash, classification in file_classifications.items()
+                if classification["nsfw_score"] >= 0.8
+            ]
+
+            # Escape if no malware or likely NSFW is detected
+            if len(malware) == 0 and len(likely_nsfw) == 0:
+                continue
+
+            # Block malware
+            await block_files(malware, "malware")
+
+            # Block likely NSFW if the post likely contains inappropriate text or the post is reported
+            if event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
+                await block_files(likely_nsfw, "likely_nsfw_and_inappropriate_post_content")
+            elif event["type"] == EventType.POST_REPORTED.value:
+                await block_files(likely_nsfw, "likely_nsfw_and_post_reported")
+
+            # Flag user
+            await flag_user(event["username"], file_classifications, auto_ban=True)
+        except ValueError as e:
+            print(f"{message}: {e}")
+            continue
+
+if __name__ == "__main__":
+    asyncio.run(main())
