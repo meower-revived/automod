@@ -179,7 +179,7 @@ async def main():
             "user": username,
             "state": "perm_ban",
             "reason": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material.",
-            "note": f"File classifications that lead to ban:\n{json.dumps([{item["_id"]["hash"]: item["classification"]} for item in db.file_classifications.find({"_id.username": username})])}"
+            "note": f"File classifications that lead to ban:\n{json.dumps([{classification['_id']['hash']: classification['classification']} for classification in db.file_classifications.find({'_id.username': username})])}"
         }))
 
         # Block previously classified likely NSFW files
