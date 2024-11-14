@@ -234,11 +234,12 @@ async def main():
                 await block_files(likely_nsfw, "likely_nsfw_and_post_reported", post_id=event.get("post_id"))
 
             # Flag user for malware and likely NSFW files
-            await flag_user(event["username"], {
-                hash: classification
-                for hash, classification in file_classifications.items()
-                if classification["malware"] or classification["nsfw_score"] >= 0.75
-            }, auto_ban=True)
+            if len(malware) or event["type"] != EventType.NEW_UPLOAD.value:
+                await flag_user(event["username"], {
+                    hash: classification
+                    for hash, classification in file_classifications.items()
+                    if classification["malware"] or classification["nsfw_score"] >= 0.75
+                }, auto_ban=True)
         except Exception as e:
             print(f"{message}: {e}")
 
