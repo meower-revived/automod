@@ -135,7 +135,7 @@ async def main():
                 db.files.delete_many({"hash": file_hash, "uploaded_by": username})
 
                 # Send alert to uploader
-                if send_alerts:
+                if send_alert:
                     await r.publish("admin", msgpack.packb({
                         "op": "alert_user",
                         "user": username,
