@@ -110,6 +110,9 @@ async def main():
 
         return classification
 
+    def is_user_new(username: str) -> bool:
+        return bool(db.usersv0.count_documents({"_id": username, "created": {"$gt": 1731974400}}, limit=1))
+
     def is_text_sexual(text: str) -> bool:
         """
         Returns whether the top classification of some text is sexual (S) or sexual/minors (S3).
@@ -227,19 +230,20 @@ async def main():
             # Block malware
             await block_files(malware, "malware", post_id=event.get("post_id"))
 
-            # Block likely NSFW if the post likely contains inappropriate text or the post is reported
-            if event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
+            # Block likely NSFW if the uploader's account is made after November 19th, the post likely contains inappropriate text, or the post is reported
+            if event["type"] == EventType.NEW_UPLOAD.value and is_user_new(event["username"]):
+                await block_files(likely_nsfw, "likely_nsfw_and_new_account", post_id=event.get("post_id"))
+            elif event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
                 await block_files(likely_nsfw, "likely_nsfw_and_inappropriate_post_content", post_id=event.get("post_id"))
             elif event["type"] == EventType.POST_REPORTED.value:
                 await block_files(likely_nsfw, "likely_nsfw_and_post_reported", post_id=event.get("post_id"))
 
             # Flag user for malware and likely NSFW files
-            if len(malware) or event["type"] != EventType.NEW_UPLOAD.value:
-                await flag_user(event["username"], {
-                    hash: classification
-                    for hash, classification in file_classifications.items()
-                    if classification["malware"] or classification["nsfw_score"] >= 0.75
-                }, auto_ban=True)
+            await flag_user(event["username"], {
+                hash: classification
+                for hash, classification in file_classifications.items()
+                if classification["malware"] or classification["nsfw_score"] >= 0.75
+            }, auto_ban=True)
         except Exception as e:
             print(f"{message}: {e}")
 
