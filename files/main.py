@@ -121,6 +121,31 @@ async def main():
         top_classification = text_classifier(text)[0]["label"]
         return top_classification == "S" or top_classification == "S3"
 
+    async def remove_files(hashes: list[str], username: str, post_id: str = None, send_alert: bool = True):
+        # Delete post
+        if post_id:
+            await r.publish("admin", msgpack.packb({
+                "op": "delete_post",
+                "id": post_id
+            }))
+
+        for file_hash in hashes:
+            try:
+                # Delete all uploads of this file by this uploader
+                db.files.delete_many({"hash": file_hash, "uploaded_by": username})
+
+                # Send alert to uploader
+                if send_alerts:
+                    await r.publish("admin", msgpack.packb({
+                        "op": "alert_user",
+                        "user": username,
+                        "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
+                    }))
+                
+
+            except Exception as e:
+                print(e)
+
     async def block_files(hashes: list[str], reason: str, send_alerts: bool = True, post_id: str = None):
         for file_hash in hashes:
             try:
@@ -185,7 +210,7 @@ async def main():
             "note": f"File classifications that lead to ban:\n{json.dumps([{classification['_id']['hash']: classification['classification']} for classification in db.file_classifications.find({'_id.username': username})])}"
         }))
 
-        # Block previously classified likely NSFW files
+        # Remove previously classified likely NSFW files
         file_hashes = [
             classification["_id"]["hash"]
             for classification in db.file_classifications.find({
@@ -193,7 +218,7 @@ async def main():
                 "classification.nsfw_score": {"$gte": 0.75}
             })
         ]
-        await block_files(file_hashes, "likely_nsfw_and_user_banned")
+        await remove_files(file_hashes, username, send_alert=False)
 
     # Start handling events
     async for message in pubsub.listen():
@@ -230,11 +255,11 @@ async def main():
             # Block malware
             await block_files(malware, "malware", post_id=event.get("post_id"))
 
-            # Block likely NSFW if the uploader's account is made after November 19th, the post likely contains inappropriate text, or the post is reported
-            if event["type"] == EventType.NEW_UPLOAD.value and is_user_new(event["username"]):
-                await block_files(likely_nsfw, "likely_nsfw_and_new_account", post_id=event.get("post_id"))
+            # Remove likely NSFW if the uploader's account is made after November 19th, the post likely contains inappropriate text, or the post is reported
+            if is_user_new(event["username"]):
+                await remove_files(likely_nsfw, event["username"], post_id=event.get("post_id"))
             elif event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
-                await block_files(likely_nsfw, "likely_nsfw_and_inappropriate_post_content", post_id=event.get("post_id"))
+                await remove_files(likely_nsfw, event["username"], post_id=event.get("post_id"))
             elif event["type"] == EventType.POST_REPORTED.value:
                 await block_files(likely_nsfw, "likely_nsfw_and_post_reported", post_id=event.get("post_id"))
 
