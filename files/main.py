@@ -28,10 +28,11 @@ from enum import Enum
 from PIL import Image
 from transformers import pipeline
 
+NSFW_SCORE_THRESHOLD = 0.8
+
 class EventType(Enum):
     NEW_UPLOAD = 0
     NEW_POST = 1
-    POST_REPORTED = 2
 
 class Event(TypedDict):
     type: EventType
@@ -42,6 +43,7 @@ class Event(TypedDict):
     post_content: Optional[str]
 
 class FileClassification(TypedDict):
+    file_hash: str
     malware: bool
     nsfw_score: float
 
@@ -63,37 +65,38 @@ async def main():
     )
 
     # Connect to ClamAV daemon
-    cd = clamd.ClamdUnixSocket(path=os.environ["CLAMD_SOCK"])
+    cd = clamd.ClamdNetworkSocket(host="127.0.0.1", port=3310)
+    #cd = clamd.ClamdUnixSocket(path=os.environ["CLAMD_SOCK"])
 
     # Initialise Hugging Face classifiers
     nsfw_image_detection = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
     text_classifier = pipeline("text-classification", model="KoalaAI/Text-Moderation")
 
-    async def get_file_classification(bucket: str, hash: str) -> FileClassification:
+    async def get_file_classification(bucket: str, file_hash: str) -> FileClassification:
         # Cached classification
-        classification = await r.get(f"automod:files:classification:{hash}")
+        classification = await r.get(f"automod:files:classification:{file_hash}")
         if classification:
             classification: FileClassification = msgpack.unpackb(classification)
             return classification
-        
-        # Create file path
-        fp = os.environ["TEMP_DIR"] + "/" + hash
 
         # Get file mime
-        mime: str = db.files.find_one({"hash": hash})["mime"]
+        mime: str = db.files.find_one({"hash": file_hash})["mime"]
 
-        # Download file to RAM dir
-        if mime.startswith("video/"):  # download thumbnail for videos
-            s3.fget_object(bucket, hash+"_thumbnail", fp)
+        # Create directory
+        fp = os.environ["TEMP_DIR"] + "/" + file_hash
+
+        # Download file to directory
+        if bucket == "attachments" and mime.startswith("video/"):  # download thumbnail for attachment videos
+            s3.fget_object(os.environ["S3_BUCKET"], f"{bucket}/{file_hash}_thumbnail", fp)
         else:
-            s3.fget_object(bucket, hash, fp)
+            s3.fget_object(os.environ["S3_BUCKET"], f"{bucket}/{file_hash}", fp)
 
         # Scan with ClamAV
         clam_result, _ = list(cd.scan(fp).values())[0]
 
-        # Scan for NSFW if file is an image
+        # Scan for NSFW if file is an image or video
         nsfw_score = 0
-        if mime.startswith("image/"):
+        if mime.startswith("image/") or mime.startswith("video/"):
             for item in nsfw_image_detection(Image.open(fp)):
                 if item["label"] == "nsfw":
                     nsfw_score = item["score"]
@@ -103,15 +106,13 @@ async def main():
 
         # Create and cache classification for 24 hours
         classification: FileClassification = {
+            "file_hash": file_hash,
             "malware": clam_result == "FOUND",
             "nsfw_score": nsfw_score
         }
-        await r.set(f"automod:files:classification:{hash}", msgpack.packb(classification), ex=86400) 
+        await r.set(f"automod:files:classification:{file_hash}", msgpack.packb(classification), ex=86400) 
 
         return classification
-
-    def is_user_new(username: str) -> bool:
-        return bool(db.usersv0.count_documents({"_id": username, "created": {"$gt": 1731974400}}, limit=1))
 
     def is_text_sexual(text: str) -> bool:
         """
@@ -121,104 +122,88 @@ async def main():
         top_classification = text_classifier(text)[0]["label"]
         return top_classification == "S" or top_classification == "S3"
 
-    async def remove_files(hashes: list[str], username: str, post_id: str = None, send_alert: bool = True):
-        # Delete post
+    async def block_file(classification: FileClassification, flag_uploaders: bool = True):
+        # Get file hash
+        file_hash = classification["file_hash"]
+
+        # Block file from being uploaded again
+        db.blocked_files.insert_one({
+            "_id": file_hash,
+            "reason": f"Files automod - Malware: {classification['malware']}, NSFW Score: {classification['nsfw_score']}",
+            "blocked_at": int(time.time())
+        })
+
+        # Delete file from S3
+        for bucket in {file["bucket"] for file in files}:
+            s3.remove_object(os.environ["S3_BUCKET"], f"{bucket}/{file_hash}")
+            if bucket == "attachments":
+                try:
+                    s3.remove_object(os.environ["S3_BUCKET"], f"{bucket}/{file_hash}_thumbnail")
+                except: pass
+
+        # Get and delete all uploads of this file
+        files = list(db.files.find({"hash": file_hash}, projection={"bucket": 1, "uploaded_by": 1}))
+        db.files.delete_many({"hash": file_hash})
+
+        # Get and delete all of the posts the file is included in
+        uploaders = {file["uploaded_by"] for file in files if file["bucket"] == "attachments"}
+        for uploader in uploaders:
+            file_ids = [file["_id"] for file in files if file["bucket"] == "attachments" and file["uploaded_by"] == uploader]
+            posts = list(db.posts.find({"u": uploader, "attachments": {"$in": file_ids}}, projection={"_id": 1, "u": 1}))
+            for post in posts:
+                await r.publish("admin", msgpack.packb({
+                    "op": "delete_post",
+                    "id": post["_id"]
+                }))
+
+                if flag_uploaders:
+                    await flag_user(post["u"], classification, post_id=post["_id"])
+
+    async def flag_user(username: str, classification: FileClassification, post_id: Optional[str] = None):
+        # Add flag if one doesn't already exist for the classification
+        if not db.automod_flags.find_one({"file_classification.file_hash": classification["file_hash"]}, projection={"_id": 1}):
+            db.automod_flags.insert_one({
+                "username": username,
+                "time": int(time.time()),
+                "file_classification": classification
+            })
+            await add_user_note(username, f"Files automod flag\nFile Hash: {classification['file_hash']}\nPost ID: {post_id}\nMalware: {classification['malware']}\nNSFW Score: {classification['nsfw_score']}")
+
+        # Ban user if they have accumulated 3 or more flags in the last 24 hours
+        if db.automod_flags.count_documents({"username": username, "time": {"$gt": int(time.time())-86400}}) >= 3:
+            await ban_user(username)
+            await add_user_note(username, "Was banned for accumulating 3 or more flags within 24 hours.")
+
+        # Report post if specified
         if post_id:
             await r.publish("admin", msgpack.packb({
-                "op": "delete_post",
-                "id": post_id
+                "op": "report_post",
+                "id": post["_id"],
+                "reason": "Files automod flag",
+                "comment": f"File Hash: {classification['file_hash']}, Malware: {classification['malware']}, NSFW Score: {classification['nsfw_score']}"
             }))
 
-        for file_hash in hashes:
-            try:
-                # Delete all uploads of this file by this uploader
-                db.files.delete_many({"hash": file_hash, "uploaded_by": username})
+    async def alert_user(username: str, content: str):
+        await r.publish("admin", msgpack.packb({
+            "op": "alert_user",
+            "username": username,
+            "note": note
+        }))
 
-                # Send alert to uploader
-                if send_alert:
-                    await r.publish("admin", msgpack.packb({
-                        "op": "alert_user",
-                        "user": username,
-                        "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
-                    }))
-                
-
-            except Exception as e:
-                print(e)
-
-    async def block_files(hashes: list[str], reason: str, send_alerts: bool = True, post_id: str = None):
-        for file_hash in hashes:
-            try:
-                # Block file from being uploaded again
-                db.blocked_files.insert_one({
-                    "_id": file_hash,
-                    "reason": reason,
-                    "blocked_at": int(time.time())
-                })
-
-                # Get all uploads of this file
-                files = list(db.files.find({"hash": file_hash}, projection={"bucket": 1, "uploaded_by": 1}))
-
-                # Send alert to uploaders
-                if send_alerts:
-                    uploaders = {file["uploaded_by"] for file in files}
-                    for username in uploaders:
-                        await r.publish("admin", msgpack.packb({
-                            "op": "alert_user",
-                            "user": username,
-                            "content": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material."
-                        }))
-
-                # Delete post
-                if post_id:
-                    await r.publish("admin", msgpack.packb({
-                        "op": "delete_post",
-                        "id": post_id
-                    }))
-
-                # Delete file from S3
-                for bucket in {file["bucket"] for file in files}:
-                    s3.remove_object(bucket, file_hash)
-                    if bucket == "attachments":
-                        try:
-                            s3.remove_object(bucket, file_hash+"_thumbnail")
-                        except: pass
-                
-
-            except Exception as e:
-                print(e)
-
-    async def flag_user(username: str, classifications: dict[str, FileClassification], auto_ban: bool = True):
-        # Log classifications
-        for file_hash, classification in classifications.items():
-            db.file_classifications.update_one({"_id": {"username": username, "hash": file_hash}}, {"$set": {
-                "classification": classification,
-                "time": int(time.time())
-            }}, upsert=True)
-
-        # Ban user if they have 3 or more classifications in the last 24 hours
-        if auto_ban and db.file_classifications.count_documents({"_id.username": username, "time": {"$gt": int(time.time())-86400}}) >= 3:
-            await ban_user(username)
+    async def add_user_note(username: str, note: str):
+        await r.publish("admin", msgpack.packb({
+            "op": "add_user_note",
+            "username": username,
+            "note": note
+        }))
 
     async def ban_user(username: str):
-        # Ban user
         await r.publish("admin", msgpack.packb({
             "op": "ban_user",
             "user": username,
             "state": "perm_ban",
-            "reason": "We've detected that one or more of your uploaded files on Meower contains prohibited content. To help keep our community safe, please avoid sharing files with malware, explicit content, or other restricted material.",
-            "note": f"File classifications that lead to ban:\n{json.dumps([{classification['_id']['hash']: classification['classification']} for classification in db.file_classifications.find({'_id.username': username})])}"
+            "reason": ""
         }))
-
-        # Remove previously classified likely NSFW files
-        file_hashes = [
-            classification["_id"]["hash"]
-            for classification in db.file_classifications.find({
-                "_id.username": username,
-                "classification.nsfw_score": {"$gte": 0.75}
-            })
-        ]
-        await remove_files(file_hashes, username, send_alert=False)
 
     # Start handling events
     async for message in pubsub.listen():
@@ -229,46 +214,12 @@ async def main():
             event: Event = msgpack.unpackb(message["data"])
 
             # Get file classifications
-            file_classifications: dict[str, FileClassification] = {
-                hash: await get_file_classification(event["file_bucket"], hash)
-                for hash in event["file_hashes"]
-            }
+            file_classifications = {await get_file_classification(event["file_bucket"], file_hash) for file_hash in event["file_hashes"]}
 
-            # Get file hashes of malware
-            malware = [
-                hash
-                for hash, classification in file_classifications.items()
-                if classification["malware"]
-            ]
-
-            # Get file hashes of likely NSFW
-            likely_nsfw = [
-                hash
-                for hash, classification in file_classifications.items()
-                if classification["nsfw_score"] >= 0.75
-            ]
-
-            # Escape if no malware or likely NSFW is detected
-            if len(malware) == 0 and len(likely_nsfw) == 0:
-                continue
-
-            # Block malware
-            await block_files(malware, "malware", post_id=event.get("post_id"))
-
-            # Remove likely NSFW if the uploader's account is made after November 19th, the post likely contains inappropriate text, or the post is reported
-            if is_user_new(event["username"]):
-                await remove_files(likely_nsfw, event["username"], post_id=event.get("post_id"))
-            elif event["type"] == EventType.NEW_POST.value and is_text_sexual(event["post_content"]):
-                await remove_files(likely_nsfw, event["username"], post_id=event.get("post_id"))
-            elif event["type"] == EventType.POST_REPORTED.value:
-                await block_files(likely_nsfw, "likely_nsfw_and_post_reported", post_id=event.get("post_id"))
-
-            # Flag user for malware and likely NSFW files
-            await flag_user(event["username"], {
-                hash: classification
-                for hash, classification in file_classifications.items()
-                if classification["malware"] or classification["nsfw_score"] >= 0.75
-            }, auto_ban=True)
+            # Block bad files and flag uploaders
+            for classification in file_classifications:
+                if classification["malware"] or classification["nsfw_score"] >= NSFW_SCORE_THRESHOLD:
+                    await block_file(classification, flag_uploaders=True)
         except Exception as e:
             print(f"{message}: {e}")
 
