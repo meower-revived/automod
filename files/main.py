@@ -1,18 +1,11 @@
 """
-Copyright Meower Media 2024.
-
+Copyright Meower Media 2025.
 
 This filter includes the following:
 - Malware detection using ClamAV
-- NSFW detection using Falconsai/nsfw_image_detection and KoalaAI/Text-Moderation from Hugging Face
+- NSFW detection using Falconsai/nsfw_image_detection from Hugging Face
 
-
-A file detected as malware will be flagged and blocked.
-
-
-A file detected as likely NSFW will be flagged. The "likely" NSFW threshold is currently at 75%.
-If the post the file is in gets reported by another user or the text of the post contains inappropriate content, the file will be blocked.
-
+Files detected as malware or likely NSFW will be flagged and blocked.
 
 If a user accumulates 3 or more unique flags within 24 hours, they will be automatically banned.
 """
@@ -70,7 +63,6 @@ async def main():
 
     # Initialise Hugging Face classifiers
     nsfw_image_detection = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
-    text_classifier = pipeline("text-classification", model="KoalaAI/Text-Moderation")
 
     async def get_file_classification(bucket: str, file_hash: str) -> FileClassification:
         # Cached classification
@@ -113,14 +105,6 @@ async def main():
         await r.set(f"automod:files:classification:{file_hash}", msgpack.packb(classification), ex=86400) 
 
         return classification
-
-    def is_text_sexual(text: str) -> bool:
-        """
-        Returns whether the top classification of some text is sexual (S) or sexual/minors (S3).
-        """
-        
-        top_classification = text_classifier(text)[0]["label"]
-        return top_classification == "S" or top_classification == "S3"
 
     async def block_file(classification: FileClassification, flag_uploaders: bool = True):
         # Get file hash
