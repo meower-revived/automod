@@ -1,0 +1,12 @@
+# Global requirements
+python-dotenv
+redis
+msgpack
+pymongo
+
+# Files
+minio
+clamd
+pillow
+transformers
+torch
